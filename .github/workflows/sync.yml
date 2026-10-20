@@ -1,0 +1,554 @@
+name: Sync raid loot
+
+# 本仓库是公开的，只放这一个 workflow；同步脚本与数据全在私有仓库（vars.CONTENT_REPO）。
+# 运行时用 CONTENT_REPO_TOKEN checkout 私有仓库 main → scripts/sync-raid-loot.py 逐个团本同步时光服团本掉落 →
+# 每个团本跑完用私有仓库的冒烟检查（scripts/smoke/raid-loot.mjs --only <areaId>）查产物，不过就退回这个团本 →
+# 与 main 比出差异 → 推 bot/raid-loot-sync 分支并开（或更新）PR → 等私有仓库的 ci.yml 在 PR 上跑完 → 合并 →
+# 升补丁版本、推 release-v* tag。tag 由 PAT 推送，会正常触发私有仓库的 deploy.yml（构建镜像部署，部署完推「已上线」）。
+#
+# PR 里有新团本（清单 raids.json 有改动）时不自动合并：新团本没有图片、raidId / 名称要人确认，
+# 打 needs-review 标签、推企业微信，等人在本地补图后合并发版。之后每一轮照常刷新同一个 PR。
+#
+# 公开仓库的日志与 artifact 谁都能看，所以：
+#   - 同步脚本、git、gh 的输出一律重定向到 $PRIV（runner 临时目录），日志里只写每个团本通过 / 失败 / 有无变化、
+#     用时和失败类型（HTTP 状态码 / 超时 / 网络错误码 / WAF 拦截 / 数据防护 / 数据校验）——不带域名
+#     （上游只有一个，带了就等于把上游地址公开），不含 URL 与数据；
+#   - 变更报告只写进私有仓库的 PR 正文，不进 step summary；
+#   - artifact 用 ARTIFACT_PASSPHRASE 加密后才上传，没配口令就不上传；
+#   - 结果推企业微信卡片（secrets.NOTIFY_WEBHOOK，自建 Message Pusher，与 forever 共用）：失败项附原因与日志末尾、
+#     CI 没过附 CI 报错；更新合并发版后由私有仓库 deploy.yml 推「已上线」。消息由私有仓库 scripts/notify.js 拼，内容不进公开日志；
+#   - 文件名、PR 号之类不写进 $GITHUB_ENV（那里的变量会在后续每个步骤开头打印到日志）；
+#   - 只允许 schedule / workflow_dispatch 触发，不接任何 PR 事件（fork 拿不到 secrets，也碰不到这里）。
+#
+# 每个团本都软失败：拉取出错、脚本的数据防护（Boss 变少、物品骤降…）或冒烟校验没过，只退回这一个团本、沿用现有数据，
+# 在通知里注明；其余团本和开 PR / 合并 / 发版照常走。上游团本列表拿不到时只同步已登记的团本。
+# 仍会让 PR 卡在 CI 的只剩构建 / 单测失败 —— 那是代码问题，要人处理。
+#
+# 解密 artifact：
+#   openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -pass env:PASS -in run-N.tar.gz.enc | tar xzf -
+
+on:
+  schedule:
+    # 每天 UTC 23:23（北京 07:23）：团本数据只在新阶段开放 / 上游修正时才变，一天一轮足够；放在低峰，发版重启后端影响小。
+    # 错开整点：GitHub 的定时任务整点最挤，负载高时会延后甚至丢轮。
+    - cron: "23 23 * * *"
+    # 保活：公开仓库 60 天没有提交，GitHub 会停掉全部 schedule。每月 1 号提交一次 .keepalive。
+    - cron: "17 3 1 * *"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 数据有更新且 CI 通过时，自动合并、发版并部署（有新团本时一律不自动合并）
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: raid-loot-sync
+  cancel-in-progress: false
+
+env:
+  CONTENT_REPO: ${{ vars.CONTENT_REPO }}
+  RELEASE: ${{ github.event_name == 'schedule' || inputs.release }}
+  SYNC_BRANCH: bot/raid-loot-sync
+  DATA_DIR: src/item_data/area_loot
+
+jobs:
+  sync:
+    if: github.event.schedule != '17 3 1 * *'
+    runs-on: ubuntu-latest
+    # 同步本身一两分钟；后面还要等私有仓库的 CI（安装依赖 + 构建 + 单测）
+    timeout-minutes: 60
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+    steps:
+      - name: Preflight
+        env:
+          TOKEN: ${{ secrets.CONTENT_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          miss=""
+          [ -n "${CONTENT_REPO}" ] || miss="$miss vars.CONTENT_REPO"
+          [ -n "${TOKEN}" ] || miss="$miss secrets.CONTENT_REPO_TOKEN"
+          if [ -n "$miss" ]; then
+            echo "::error::缺少配置：$miss（Settings → Secrets and variables → Actions）"
+            exit 1
+          fi
+          PRIV="${RUNNER_TEMP}/private"
+          mkdir -p "$PRIV"
+          date +%s > "$PRIV/t0"   # 通知里的用时
+          echo "PRIV=${PRIV}" >> "$GITHUB_ENV"
+          echo "自动发版：${RELEASE}"
+
+      - name: Checkout content repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.CONTENT_REPO }}
+          token: ${{ secrets.CONTENT_REPO_TOKEN }}
+          ref: main
+          # 不把 token 留在 .git/config 里：同步脚本在这个目录里跑，推送时再临时带上
+          persist-credentials: false
+
+      # 同步脚本只用 Python 标准库（ubuntu-latest 自带 python3），冒烟检查与通知只用 Node 内置模块，都不用装依赖。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Pull upstream data
+        id: pull
+        env:
+          # 可选：机房 IP 访问上游被拦时，配一个代理（同步脚本读 RAID_LOOT_API_PROXY）
+          RAID_LOOT_API_PROXY: ${{ secrets.RAID_LOOT_API_PROXY }}
+        run: |
+          # 不用 -e：GitHub 默认用 bash -e 跑，某一项失败时 return 非 0 会让整步退出，后面的团本、开 PR、发版全被跳过。
+          # 每一项失败只跳过它自己，由 step 记下来；这一步本身始终成功退出。
+          set +e -uo pipefail
+          REPORT="$PRIV/report.md"
+          LOG="$PRIV/sync.log"
+          ITEMS="$PRIV/items"       # 每一项单独一份完整输出
+          FAILS="$PRIV/failures"    # 每个失败项一份：项名、原因、说明、日志末尾 → Notify WeCom 推送
+          mkdir -p "$ITEMS" "$FAILS"
+          : > "$REPORT"
+          printf '项\t退出码\t秒\t开始（UTC）\n' > "$PRIV/timeline.tsv"
+          N=0
+          FAILED=""
+          fmt_dur() { if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi; }
+          # 失败类型：取同步脚本打的「失败类型：…」，只放行已知的分类（状态码 / 超时 / 错误码这类不含数据的信息），能进公开日志
+          why_failed() {
+            local kind
+            [ "$1" -eq 124 ] && { echo "超时"; return; }
+            kind="$(sed -nE 's/^失败类型：(HTTP [0-9]{3}|超时|E[A-Z_]+|DNS 解析失败|WAF 拦截|数据防护|接口返回失败|分页超出上限|响应不是 JSON|[A-Za-z]+(Error|Exception))$/\1/p' "$2" | tail -n 1)"
+            echo "退出码 $1${kind:+，$kind}"
+          }
+          # 退回靠 git 索引做检查点：每一项跑完（无论成败）都 git add 进索引；退回 = 工作区按索引还原 + 删掉索引里没有的新文件。
+          # 只动团本数据目录（与下面 Gate - changed paths 的白名单一致）。
+          checkpoint() { git add -A -- "$DATA_DIR"; }
+          rollback() { git checkout -q -- "$DATA_DIR"; git clean -fdq -- "$DATA_DIR"; }
+          # 跑一项：输出进 $ITEMS/NN.log 并追加到 $LOG；公开日志只写通过 / 失败、用时和失败类型。
+          # 用法：step [--check <areaId>] <项名> <失败说明> <命令…>。带 --check 的项失败或冒烟没过时退回这个团本
+          # （同步脚本出错时本来就不写文件，退回只是兜底），同时截掉它写进报告的部分。
+          step() {
+            local check=""
+            if [ "$1" = "--check" ]; then check="$2"; shift 2; fi
+            local name="$1" note="$2"; shift 2
+            local id out t0 start rc dur why rsize invalid=false
+            N=$((N + 1)); id="$(printf '%02d' "$N")"; out="$ITEMS/$id.log"
+            t0=$SECONDS; start="$(date -u +%FT%TZ)"
+            rsize="$(wc -c < "$REPORT")"
+            { echo "===== [$id] $name  $start"; echo "\$ $*"; } >> "$LOG"
+            "$@" > "$out" 2>&1 < /dev/null
+            rc=$?
+            if [ -n "$check" ]; then
+              if [ "$rc" -eq 0 ]; then
+                echo "--- 数据校验：scripts/smoke/raid-loot.mjs --only $check ---" >> "$out"
+                if ! node scripts/smoke/raid-loot.mjs --only "$check" >> "$out" 2>&1; then
+                  rc=98
+                  invalid=true
+                fi
+              fi
+              if [ "$rc" -ne 0 ]; then
+                rollback
+                truncate -s "$rsize" "$REPORT"
+              fi
+            fi
+            checkpoint
+            dur=$((SECONDS - t0))
+            cat "$out" >> "$LOG"
+            echo "===== [$id] $name 结束：退出码 $rc，用时 $(fmt_dur "$dur")" >> "$LOG"
+            printf '%s\t%s\t%s\t%s\n' "$name" "$rc" "$dur" "$start" >> "$PRIV/timeline.tsv"
+            if [ "$rc" -eq 0 ]; then
+              echo "✓ $name（$(fmt_dur "$dur")）"
+              return 0
+            fi
+            if [ "$invalid" = true ]; then
+              why="数据校验没通过"
+              note="拉到的数据没通过数据校验，本次不更新这个团本，沿用现有数据（多半是上游出了脏数据，要改同步脚本兜住）："
+              note="${note}"$'\n'"$(grep -E '^  ✗ ' "$out" | sed -E 's/^  ✗ /  - /' | head -n 20)"
+            else
+              why="$(why_failed "$rc" "$out")"
+            fi
+            echo "::warning::$name 失败，本次跳过（${why}，用时 $(fmt_dur "$dur")；详情在加密 artifact 和企业微信通知里）"
+            { echo "✗ $name（${why}，用时 $(fmt_dur "$dur")，开始于 $start）"
+              echo "$note"
+              echo "--- 日志末尾 ---"
+              tail -n 200 "$out"
+            } > "$FAILS/$id.txt"
+            FAILED="${FAILED:+$FAILED、}$name"
+            return "$rc"
+          }
+
+          # 要同步哪些团本：清单里已登记的 + 上游新开的；上游团本列表拿不到时 plan 只列已登记的（退出码 2，记为失败项）
+          step "团本列表" "上游团本列表不可用，本次只同步已登记的团本，新开的团本下一轮再发现。" \
+            python3 scripts/sync-raid-loot.py plan --out "$PRIV/plan.tsv"
+          if [ ! -s "$PRIV/plan.tsv" ]; then
+            echo "::error::没拿到要同步的团本（清单读取失败？详情在加密 artifact 里）"
+            exit 1
+          fi
+          while IFS=$'\t' read -r AREA KIND; do
+            [ -n "$AREA" ] || continue
+            if [ "$KIND" = new ]; then NAME="新团本 $AREA"; else NAME="团本 $AREA"; fi
+            # 单个团本限时 10 分钟（每个请求 20 秒超时、重试 3 次，正常几秒跑完）
+            step --check "$AREA" "$NAME" "同步失败，本次跳过，沿用现有数据。" \
+              timeout 10m python3 scripts/sync-raid-loot.py sync "$AREA" --report "$REPORT"
+          done < "$PRIV/plan.tsv"
+
+          # 看整个仓库：数据目录以外冒出改动也算变化，交给下面的闸门拦下
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "### 团本数据有变化" >> "$GITHUB_STEP_SUMMARY"
+            echo "团本数据有变化"
+            # 清单有改动 = 有新团本登记进来：不自动合并
+            if [ -n "$(git status --porcelain -- "$DATA_DIR/raids.json")" ]; then
+              echo "new_raid=true" >> "$GITHUB_OUTPUT"
+              echo "有新团本，PR 不自动合并"
+            fi
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "### 团本数据没有变化" >> "$GITHUB_STEP_SUMMARY"
+            echo "团本数据没有变化"
+          fi
+          if [ -n "$FAILED" ]; then
+            echo "- 失败并跳过：${FAILED}（沿用现有数据，日志末尾已推企业微信）" >> "$GITHUB_STEP_SUMMARY"
+            echo "本轮失败并跳过：${FAILED}"
+          fi
+          exit 0
+
+      - name: Gate - changed paths
+        id: gate
+        if: steps.pull.outputs.changed == 'true'
+        run: |
+          # 只允许动同步脚本的产物：团本数据文件与团本清单。输出含文件名，全部进 gate.log
+          bash -euo pipefail > "$PRIV/gate.log" 2>&1 <<'GATE' || { echo "::error::改动超出团本数据文件，不开 PR（原因见加密 artifact 里的 gate.log）"; exit 1; }
+          BAD=$(git -c core.quotepath=off status --porcelain --untracked-files=all \
+            | cut -c4- \
+            | grep -vE '^src/item_data/area_loot/(area_[0-9]+_items\.json|raids\.json)$' || true)
+          if [ -n "$BAD" ]; then
+            echo "同步改动了团本数据文件以外的文件："
+            echo "$BAD"
+            exit 1
+          fi
+          git -c core.quotepath=off status --porcelain --untracked-files=all | wc -l
+          GATE
+          echo "闸门通过"
+
+      - name: Push branch and open PR
+        id: pr
+        if: steps.pull.outputs.changed == 'true'
+        env:
+          TOKEN: ${{ secrets.CONTENT_REPO_TOKEN }}
+          GH_TOKEN: ${{ secrets.CONTENT_REPO_TOKEN }}
+          NEW_RAID: ${{ steps.pull.outputs.new_raid }}
+        run: |
+          set -euo pipefail
+          DAY=$(date -u +%F)
+          TITLE="chore(data): 同步团本掉落数据（${DAY}）"
+          if [ "$NEW_RAID" = "true" ]; then
+            NEXT="本次登记了新团本（src/item_data/area_loot/raids.json 有改动），**不会自动合并**：新团本没有 Boss / 封面图片，raidId 与名称也要人确认。请在本地 checkout 这个分支，用 \`python3 scripts/sync-raid-loot.py sync <areaId> --images --proxy <代理>\` 补图（图片写到 auction-web），确认清单条目后人工合并并发版。"
+          elif [ "$RELEASE" = "true" ]; then
+            NEXT="auction-server 的 CI 在本 PR 上通过后自动合并，并发布新版本、部署上线；CI 没过就停在这里等人处理。"
+          else
+            NEXT="本次手动运行关闭了自动发布，请人工合并。"
+          fi
+          # PR 正文上限 65536 字：报告过长时截断（完整报告在加密 artifact 里）
+          python3 - "$PRIV/report.md" "$PRIV/report.digest.md" <<'PY'
+          import sys
+          text = open(sys.argv[1], encoding="utf-8").read().strip() or "（报告里没有列出具体变化）"
+          if len(text) > 55000:
+              text = text[:55000].rsplit("\n", 1)[0] + "\n\n…（报告过长已截断，完整报告在加密 artifact 里）"
+          open(sys.argv[2], "w", encoding="utf-8").write(text + "\n")
+          PY
+          BODY="$PRIV/pr-body.md"
+          {
+            echo "定时数据同步自动生成：时光服团本掉落数据有更新。"
+            echo
+            echo "$NEXT"
+            echo
+            echo "## 变更"
+            echo
+            cat "$PRIV/report.digest.md"
+            echo
+            echo "运行记录（日志不含数据；完整日志在加密 artifact 里）：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > "$BODY"
+          {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -B "$SYNC_BRANCH"
+            git add -A -- "$DATA_DIR"
+            git commit -m "$TITLE"
+            git push --force "https://x-access-token:${TOKEN}@github.com/${CONTENT_REPO}.git" "HEAD:refs/heads/${SYNC_BRANCH}"
+          } > "$PRIV/push.log" 2>&1 || { echo "::error::推送 ${SYNC_BRANCH} 失败（详情在加密 artifact 里）"; exit 1; }
+          PR=$(gh pr list --repo "$CONTENT_REPO" --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$PR" ]; then
+            gh pr edit "$PR" --repo "$CONTENT_REPO" --title "$TITLE" --body-file "$BODY" > /dev/null 2>> "$PRIV/pr.err"
+            echo "已更新 PR"
+          else
+            URL=$(gh pr create --repo "$CONTENT_REPO" --base main --head "$SYNC_BRANCH" \
+                    --title "$TITLE" --body-file "$BODY" 2>> "$PRIV/pr.err")
+            PR="${URL##*/}"
+            echo "已开 PR"
+          fi
+          # 标签在 auction-server 里预先建好（data-sync、needs-review）；没建也不影响流程
+          gh pr edit "$PR" --repo "$CONTENT_REPO" --add-label data-sync > /dev/null 2>> "$PRIV/pr.err" || true
+          if [ "$NEW_RAID" = "true" ]; then
+            gh pr edit "$PR" --repo "$CONTENT_REPO" --add-label needs-review > /dev/null 2>> "$PRIV/pr.err" || true
+          else
+            gh pr edit "$PR" --repo "$CONTENT_REPO" --remove-label needs-review > /dev/null 2>> "$PRIV/pr.err" || true
+          fi
+          # PR 号与提交 SHA 经文件传给后面的步骤：写进步骤的 env 会被打印到公开日志
+          echo "opened=true" >> "$GITHUB_OUTPUT"
+          echo "$PR" > "$PRIV/pr-number"
+          git rev-parse HEAD > "$PRIV/pr-sha"
+
+      - name: Wait for CI and merge
+        id: merge
+        if: steps.pr.outputs.opened == 'true' && env.RELEASE == 'true' && steps.pull.outputs.new_raid != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CONTENT_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR="$(cat "$PRIV/pr-number")"
+          SHA="$(cat "$PRIV/pr-sha")"
+          # 按 head SHA 找私有仓库 ci.yml 的 pull_request 运行（排队时 PR 上还没有检查，不能看 gh pr checks）。
+          RUN_ID=""
+          for i in $(seq 1 30); do
+            RUN_ID="$(gh run list --repo "$CONTENT_REPO" --workflow ci.yml --commit "$SHA" --event pull_request \
+              --json databaseId --jq '.[0].databaseId // empty' 2>> "$PRIV/merge.log" || true)"
+            [ -n "$RUN_ID" ] && break
+            sleep 10
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::五分钟内私有仓库没有在 PR 上跑 CI，不合并。检查 ci.yml 的 pull_request 触发条件。"
+            exit 1
+          fi
+          echo "等待私有仓库 CI…"
+          if ! gh run watch "$RUN_ID" --repo "$CONTENT_REPO" --exit-status --interval 30 > "$PRIV/ci-watch.log" 2>&1; then
+            # 失败步骤的日志（「job<TAB>step<TAB>时间戳 内容」→「step | 内容」），只进 $PRIV 和企业微信通知
+            gh run view "$RUN_ID" --repo "$CONTENT_REPO" --log-failed 2>&1 \
+              | sed -E $'s/^[^\t]*\t([^\t]*)\t[0-9T:.-]+Z ?/\\1 | /' > "$PRIV/ci-failed.log"
+            echo "::error::私有仓库 CI 未通过，PR 留着人工处理，不发版"
+            exit 1
+          fi
+          echo "CI 通过"
+          gh pr merge "$PR" --repo "$CONTENT_REPO" --squash --delete-branch \
+            --subject "chore(data): 同步团本掉落数据（$(date -u +%F)）" >> "$PRIV/merge.log" 2>&1 \
+            || { echo "::error::合并失败（多半是 main 上手动改了团本数据产生冲突），PR 留着人工处理"; exit 1; }
+          echo "已合并"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      # 推企业微信卡片（secrets.NOTIFY_WEBHOOK = 自建 Message Pusher 的 webhook 地址；卡片放概况和失败项，点详情看完整内容）。
+      # 消息内容只发出去，不进公开日志：
+      #   ❌ 流程中断（拉数据异常退出 / 闸门 / 推送开 PR / 等 CI 合并）：卡在哪，外加相关日志末尾；CI 没过附 CI 报错
+      #   ⚠️ 有团本失败（已跳过、其余照常）：每项的原因、用时和日志末尾 200 行，外加本轮的数据变更
+      #   📦 有更新但没自动合并（有新团本 / 手动运行关了发版）：变更摘要 + PR
+      #   有更新并已合并：这里不推，发版部署完由私有仓库 deploy.yml 推「✅ 团本数据更新已上线」（带变更摘要）
+      #   没变化、没失败：不推；仓库变量 NOTIFY_ALL=true 时也推一条 ✅
+      # 消息由私有仓库的 scripts/notify.js 拼；checkout 失败没有脚本时退回 curl 发一行纯文本。推送失败只记警告。
+      - name: Notify WeCom
+        if: always()
+        env:
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          NOTIFY_ALL: ${{ vars.NOTIFY_ALL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NO: ${{ github.run_number }}
+          JOB_STATUS: ${{ job.status }}
+          PULL: ${{ steps.pull.outcome }}
+          CHANGED: ${{ steps.pull.outputs.changed }}
+          NEW_RAID: ${{ steps.pull.outputs.new_raid }}
+          GATE: ${{ steps.gate.outcome }}
+          PR_STEP: ${{ steps.pr.outcome }}
+          MERGE: ${{ steps.merge.outcome }}
+          MERGED: ${{ steps.merge.outputs.merged }}
+        run: |
+          set +e -uo pipefail   # 推送失败（curl 出错等）也不能让这一步失败
+          if [ -z "$NOTIFY_WEBHOOK" ]; then
+            echo "::warning::未配置 NOTIFY_WEBHOOK，本轮结果没推企业微信"
+            exit 0
+          fi
+          PRIV="${PRIV:-${RUNNER_TEMP}/private}"
+          FAILS="$PRIV/failures"
+          N="$PRIV/notify"
+          mkdir -p "$FAILS" "$N"
+          # 流程步骤失败：标题 + 相关日志末尾（文件名以 z 开头，排在同步项后面）
+          flow_fail() {
+            local key="$1" title="$2"; shift 2
+            { echo "✗ $title"; echo "--- 日志末尾 ---"
+              for f in "$@"; do [ -s "$f" ] && tail -n 200 "$f"; done
+            } > "$FAILS/z-$key.txt"
+          }
+          [ "$PULL" = failure ] && flow_fail pull "拉取团本数据：步骤异常退出" "$PRIV/sync.log"
+          [ "$GATE" = failure ] && flow_fail gate "闸门：改动超出团本数据文件，没开 PR" "$PRIV/gate.log"
+          [ "$PR_STEP" = failure ] && flow_fail pr "推送 bot/raid-loot-sync / 开 PR 失败" "$PRIV/push.log" "$PRIV/pr.err"
+          if [ "$MERGE" = failure ]; then
+            if [ -s "$PRIV/ci-failed.log" ]; then
+              flow_fail merge "auction-server CI 没过，PR 留着人工处理，没发版" "$PRIV/ci-failed.log"
+            else
+              flow_fail merge "等 CI / 合并失败，PR 留着人工处理，没发版" "$PRIV/ci-watch.log" "$PRIV/merge.log"
+            fi
+          fi
+          shopt -s nullglob
+          files=("$FAILS"/*.txt)
+          if [ ${#files[@]} -eq 0 ] && [ "$JOB_STATUS" = failure ]; then
+            flow_fail other "其他步骤失败（配置 / checkout），见运行记录"
+            files=("$FAILS"/*.txt)
+          fi
+
+          if [ "$JOB_STATUS" = cancelled ]; then
+            TITLE="⏹ 团本数据同步 #${RUN_NO}：被取消（手动取消或超时）"
+          elif [ "$JOB_STATUS" != success ]; then
+            TITLE="❌ 团本数据同步 #${RUN_NO}：流程中断"
+          elif [ ${#files[@]} -gt 0 ]; then
+            TITLE="⚠️ 团本数据同步 #${RUN_NO}：${#files[@]} 项失败，已跳过，其余照常"
+          elif [ "$CHANGED" = true ] && [ "$MERGED" != true ]; then
+            TITLE="📦 团本数据同步 #${RUN_NO}：有更新，PR 待合并"
+          elif [ "$NOTIFY_ALL" = true ]; then
+            if [ "$CHANGED" = true ]; then TITLE="✅ 团本数据同步 #${RUN_NO}：有更新，已合并发版"; else TITLE="✅ 团本数据同步 #${RUN_NO}：上游无变化"; fi
+          else
+            echo "没有失败项、没有待处理的更新，不推送（更新上线后由私有仓库 deploy.yml 推送）"
+            exit 0
+          fi
+
+          # 开头一段：跑了几项、有没有变化、接下来怎样、用时
+          T=""; [ -s "$PRIV/t0" ] && T=$(( $(date +%s) - $(cat "$PRIV/t0") ))
+          RAN=$(tail -n +2 "$PRIV/timeline.tsv" 2>/dev/null | wc -l | tr -d ' ')
+          {
+            printf '**团本数据同步** · 跑了 %s 项' "$RAN"
+            [ -n "$T" ] && printf ' · 用时 %dm%02ds' $((T / 60)) $((T % 60))
+            echo
+            if [ "$CHANGED" = true ]; then
+              if [ "$MERGED" = true ]; then echo "数据有更新，已合并，接着发版部署（上线后另有通知）"
+              elif [ "$PR_STEP" = success ] && [ "$NEW_RAID" = true ]; then echo "有新团本登记进来，PR 不自动合并：本地补图、确认 raidId / 名称后人工合并发版"
+              elif [ "$PR_STEP" = success ] && [ "$RELEASE" != true ]; then echo "数据有更新，本次手动运行关了自动发版，PR 等人工合并"
+              elif [ "$PR_STEP" = success ]; then echo "数据有更新，PR 已开但没合并"
+              else echo "数据有更新，但没开成 PR"
+              fi
+            elif [ "$PULL" = success ]; then
+              echo "团本数据没有变化"
+            fi
+          } > "$N/summary.md"
+
+          ARGS=(--title "$TITLE" --md "$N/summary.md")
+          for f in "${files[@]}"; do ARGS+=(--fail "$f"); done
+          [ "$CHANGED" = true ] && ARGS+=(--report "$PRIV/report.md")
+          ARGS+=(--button "运行记录|${RUN_URL}")
+          [ -s "$PRIV/pr-number" ] && ARGS+=(--button "PR|https://github.com/${CONTENT_REPO}/pull/$(cat "$PRIV/pr-number")")
+
+          if [ -f scripts/notify.js ]; then
+            node scripts/notify.js "${ARGS[@]}" > "$N/send.log" 2>&1
+            RC=$?
+            cat "$N/send.log"   # 只有「已推送 / 被拒 + 原因」，不含消息内容
+          else
+            # checkout 都没成功：没有脚本，只发标题，详情页放运行记录链接
+            jq -n --arg t "$TITLE" --arg u "$RUN_URL" \
+              '{title: $t, description: "没拼成完整通知（私有仓库 checkout 失败？），点详情看运行记录", content: "[运行记录](\($u))"}' > "$N/msg.json"
+            curl -sS -m 20 -H 'Content-Type: application/json' --data-binary @"$N/msg.json" "$NOTIFY_WEBHOOK" > "$N/send.log" 2>&1
+            grep -q '"success":true' "$N/send.log"; RC=$?
+          fi
+          [ "$RC" -eq 0 ] || echo "::warning::企业微信推送失败（「Webhook 构建规则解析失败」= Message Pusher 里这个 webhook 的规则没配成原样透传）"
+
+      - name: Encrypt logs
+        if: always()
+        env:
+          PASS: ${{ secrets.ARTIFACT_PASSPHRASE }}
+        run: |
+          set -uo pipefail
+          if [ -z "${PASS}" ]; then
+            echo "::warning::未配置 ARTIFACT_PASSPHRASE，跳过 artifact（公开仓库不上传明文）"
+            exit 0
+          fi
+          [ -d "${PRIV:-}" ] || exit 0
+          mkdir -p "${RUNNER_TEMP}/out"
+          tar czf - -C "$PRIV" . 2>/dev/null \
+            | openssl enc -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -salt -pass env:PASS \
+              -out "${RUNNER_TEMP}/out/run-${{ github.run_number }}.tar.gz.enc"
+          echo "已加密：$(du -h "${RUNNER_TEMP}/out/run-${{ github.run_number }}.tar.gz.enc" | cut -f1)"
+
+      - name: Upload encrypted artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-run-${{ github.run_number }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    needs: sync
+    if: needs.sync.outputs.merged == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout content repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.CONTENT_REPO }}
+          token: ${{ secrets.CONTENT_REPO_TOKEN }}
+          ref: main
+          fetch-depth: 0 # standard-version 要读历史提交与已有 tag
+          persist-credentials: false
+
+      # 版本取私有仓库 package.json 的 packageManager
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Bump version, changelog and tag
+        env:
+          TOKEN: ${{ secrets.CONTENT_REPO_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          LOG="${RUNNER_TEMP}/release.log"
+          # 输出只进 release.log（失败时推企业微信）。不能写成 { … } > log || { … }：|| 左边的命令里 set -e 不生效，
+          # standard-version 打 tag 失败（同名 tag 已存在）也会接着推 main，最后照样报「已发版」。
+          exec 3>&1 > "$LOG" 2>&1
+          trap 'echo "::error::发版失败" >&3' ERR
+          pnpm install --frozen-lockfile
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 只升补丁号；版本提交、CHANGELOG、release-v* tag 由 standard-version 生成（配置见私有仓库 package.json）。
+          # 用 pnpm exec 而不是 pnpm release：后者的 postrelease 钩子会用没有凭证的 origin 推送。
+          pnpm exec standard-version --release-as patch
+          TAG="release-v$(node -p 'require("./package.json").version')"
+          # PAT 推的 tag 会触发私有仓库 deploy.yml 的 push tags（GITHUB_TOKEN 推的不会）。
+          # tag 显式推，且与 main 原子推送：--follow-tags 碰到远端已有同名 tag 会静默跳过，main 升了版本却不部署。
+          git push --atomic "https://x-access-token:${TOKEN}@github.com/${CONTENT_REPO}.git" HEAD:main "refs/tags/${TAG}"
+          exec >&3 2>&1
+          echo "### 已发版：${TAG}，私有仓库 deploy.yml 接着部署" >> "$GITHUB_STEP_SUMMARY"
+          echo "已发版"
+
+      # 发版失败推企业微信（数据已合并进 main，只是没升版本 / 没部署）。发版成功不在这里推：
+      # tag 触发私有仓库 deploy.yml，部署完由它推「✅ 团本数据更新已上线」或「❌ 后端部署失败」。
+      - name: Notify WeCom on failure
+        if: failure()
+        env:
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NO: ${{ github.run_number }}
+        run: |
+          set +e -uo pipefail
+          [ -n "$NOTIFY_WEBHOOK" ] || { echo "::warning::未配置 NOTIFY_WEBHOOK，发版失败没推企业微信"; exit 0; }
+          N="${RUNNER_TEMP}/notify"
+          mkdir -p "$N"
+          echo "团本数据已合并进 main，但没升版本、没部署。修好后在 auction-server 手动发版（pnpm release）。" > "$N/summary.md"
+          { echo "✗ 升版本 / 推 tag 失败"; tail -n 200 "${RUNNER_TEMP}/release.log" 2>/dev/null; } > "$N/fail.txt"
+          node scripts/notify.js --title "❌ 团本数据同步 #${RUN_NO}：数据已合并，发版失败" \
+            --md "$N/summary.md" --fail "$N/fail.txt" --button "运行记录|${RUN_URL}" \
+            || echo "::warning::企业微信推送失败（checkout 失败时没有脚本，见运行记录）"
+
+  keepalive:
+    if: github.event.schedule == '17 3 1 * *'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit keepalive
+        run: |
+          date -u +%FT%TZ > .keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git commit -q -m "chore: keepalive"
+          git push -q
